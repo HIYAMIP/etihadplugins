@@ -1,21 +1,21 @@
-import os
 import discord
-import asyncio
-import aiohttp
 from discord.ext import commands, tasks
-from dotenv import load_dotenv
-from datetime import datetime, timedelta, timezone
+import aiohttp
+import asyncio
 import re
+from datetime import datetime, timedelta, timezone
 
-load_dotenv()
+# Make sure these IDs are ints, not strings
+GUILD_ID = 1288926604415733854
+REQUIRED_ROLE_ID = 1288926707285495941
+ANNOUNCEMENT_CHANNEL_ID = 1290777608782483640
+WEBHOOK_URL = "https://discord.com/api/webhooks/1290778044948283483/bquY_ka1ndRd7OL7tpZYJUuw5RVQTch0fe_3ddG-uPYTnXOvOZVGZTeY3c9BYAlkuPBD"
+WEBHOOK_MESSAGE_ID = 1290778370749104263
+LOGGING_CHANNEL_ID = 1288927464080543806
 
-TOKEN=os.getenv("TOKEN")
-GUILD_ID="1288926604415733854"
-REQUIRED_ROLE_ID="1288926707285495941"
-ANNOUNCEMENT_CHANNEL_ID="1290777608782483640"
-WEBHOOK_URL="https://discord.com/api/webhooks/1290778044948283483/bquY_ka1ndRd7OL7tpZYJUuw5RVQTch0fe_3ddG-uPYTnXOvOZVGZTeY3c9BYAlkuPBD"
-WEBHOOK_MESSAGE_ID="1290778370749104263"
-LOGGING_CHANNEL_ID="1288927464080543806"
+# TOKEN must be set on bot object or passed somehow (recommended: bot token is set outside plugin)
+# We'll access it with `self.bot.http.token` here, which is the bot token (discord.py internal)
+# If your bot does not expose token, you may need to pass it in differently.
 
 from embeds import (
     flighterrorembed,
@@ -33,14 +33,25 @@ class FlightScheduler(commands.Cog):
 
     @tasks.loop(minutes=5)
     async def update_webhook(self):
+        token = self.bot.http.token
+        if not token:
+            return  # no token available, skip
+
+        headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
         async with aiohttp.ClientSession() as sess:
-            headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
-            r = await sess.get(f"https://discord.com/api/v10/guilds/{GUILD_ID}/scheduled-events", headers=headers)
-            events = await r.json()
+            try:
+                r = await sess.get(f"https://discord.com/api/v10/guilds/{GUILD_ID}/scheduled-events", headers=headers)
+                if r.status != 200:
+                    return
+                events = await r.json()
+            except Exception:
+                return
+
             upcoming = sorted(
                 [e for e in events if datetime.fromisoformat(e['scheduled_start_time'][:-1]) > datetime.utcnow()],
                 key=lambda e: e['scheduled_start_time']
             )
+
             if not upcoming:
                 embed = {
                     "title": "Upcoming Flights",
@@ -56,15 +67,22 @@ class FlightScheduler(commands.Cog):
                     "footer": {"text": "Updates every 5 min"}
                 }
 
-            await sess.patch(
-                f"{WEBHOOK_URL}/messages/{WEBHOOK_MESSAGE_ID}",
-                json={"embeds": [embed]},
-                headers={"Content-Type": "application/json"}
-            )
+            # PATCH the webhook message
+            try:
+                await sess.patch(
+                    f"{WEBHOOK_URL}/messages/{WEBHOOK_MESSAGE_ID}",
+                    json={"embeds": [embed]},
+                    headers={"Content-Type": "application/json"}
+                )
+            except Exception:
+                pass
 
             ch = self.bot.get_channel(LOGGING_CHANNEL_ID)
             if ch:
-                await ch.send("Updated webhook.")
+                try:
+                    await ch.send("Updated webhook.")
+                except Exception:
+                    pass
 
     async def ask(self, ctx, prompt):
         if isinstance(prompt, discord.Embed):
@@ -105,8 +123,11 @@ class FlightScheduler(commands.Cog):
 
             payload = {
                 "name": f"{flight_number} | {departure} - {arrival}",
-                "description": (f'<:Tail:1375059430269517885> **Etihad Airways** cordially invites you to attend Flight **{flight_number}**, operating from **{departure}** to **{arrival}** aboard a **{aircraft_type}**.\n\n'
-                                f'<:Star:1375535064141795460> All passengers are requested to review the flight itinerary in `#itinerary` prior to departure to ensure a smooth and professional operation. '),
+                "description": (
+                    f'<:Tail:1375059430269517885> **Etihad Airways** cordially invites you to attend Flight **{flight_number}**, '
+                    f'operating from **{departure}** to **{arrival}** aboard a **{aircraft_type}**.\n\n'
+                    f'<:Star:1375535064141795460> All passengers are requested to review the flight itinerary in `#itinerary` prior to departure to ensure a smooth and professional operation.'
+                ),
                 "scheduled_start_time": start.isoformat(),
                 "scheduled_end_time": end.isoformat(),
                 "privacy_level": 2,
@@ -114,11 +135,14 @@ class FlightScheduler(commands.Cog):
                 "entity_metadata": {"location": roblox_link}
             }
 
+            token = self.bot.http.token
+            headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+
             async with aiohttp.ClientSession() as sess:
                 r = await sess.post(
                     f"https://discord.com/api/v10/guilds/{GUILD_ID}/scheduled-events",
                     json=payload,
-                    headers={"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
+                    headers=headers
                 )
                 if r.status == 201:
                     await ctx.send(embed=flightsuccessembed("✅ Flight created successfully!"))
@@ -127,114 +151,4 @@ class FlightScheduler(commands.Cog):
                         await log.send(embed=discord.Embed(
                             title="Logging",
                             color=0xE5E1DE
-                        ).add_field(name="Create Flight", value=f"{ctx.author} created flight {flight_number}"))
-                else:
-                    await ctx.send(embed=flighterrorembed(f"Failed to create flight (status {r.status})."))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            await ctx.send(embed=flighterrorembed(f"❌ Error: {e}"))
-
-    @commands.command()
-    async def startflight(self, ctx, link=None):
-        if REQUIRED_ROLE_ID not in [r.id for r in ctx.author.roles]:
-            await ctx.reply("You don't have permission to use this command.")
-            return
-        if not link:
-            await ctx.reply(embed=flighterrorembed("Provide an event link!"))
-            return
-
-        event_id = link.rstrip('/').split('/')[-1]
-
-        async with aiohttp.ClientSession() as sess:
-            r = await sess.get(f"https://discord.com/api/v10/guilds/{GUILD_ID}/scheduled-events/{event_id}",
-                            headers={"Authorization": f"Bot {TOKEN}"})
-            if r.status != 200:
-                await ctx.reply(embed=flighterrorembed("Invalid link or event!"))
-                return
-            ev = await r.json()
-
-        roblox_link = ev.get('entity_metadata', {}).get('location', '')
-        description = ev.get('description', '').strip()
-
-        pattern = (
-            r"<:Tail:\d+>\s+\*\*Etihad Airways\*\* cordially invites you to attend Flight\s+\*\*(.+?)\*\*, "
-            r"operating from\s+\*\*(.+?)\*\* to\s+\*\*(.+?)\*\* aboard"
-        )
-
-        match = re.search(pattern, description, re.DOTALL)
-        if not match:
-            return await ctx.reply(embed=flighterrorembed("Failed to parse event description for flight info."))
-
-        flight_number = match.group(1).strip()
-        departure = match.group(2).strip()
-        arrival = match.group(3).strip()
-
-        now = datetime.now(timezone.utc)
-        start_time = datetime.fromisoformat(ev['scheduled_start_time'].replace('Z', '+00:00'))
-
-        lock_time = start_time + timedelta(minutes=15)
-        minutes_until_lock = max(0, int((lock_time - now).total_seconds() / 60))
-
-        message = (
-            f"<:Plane:1379811896106156052> **Check-in Now Open**\n"
-            f"-# {departure}\n\n"
-            f"<:Dash:1379811908886204567> **-**\n"
-            f"> Attention all passengers flying to **{arrival}** on flight **{flight_number}**, check-in is now open and will close in **{minutes_until_lock} minutes**. "
-            "If you are in need of any assistance throughout your journey, please reach out to a member of staff! Have a good flight.\n\n"
-            f"<:Link:1379811829076856842> {roblox_link}\n\n"
-            "|| @everyone @Operations Ping ||"
-        )
-
-        chan = self.bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-        if not chan:
-            await ctx.reply(embed=flighterrorembed("Announcement channel not found."))
-            return
-
-        msg = await chan.send(message)
-
-        async def send_checkin_closed():
-            await asyncio.sleep((lock_time - datetime.now(timezone.utc)).total_seconds())
-            try:
-                await msg.delete()
-            except discord.HTTPException:
-                pass
-            closed_message = (
-                f"<:Lock:1379811903332679830> **Check-in Closed**\n"
-                f"-# {departure}\n\n"
-                f"<:Dash:1379811908886204567> **-**\n"
-                f"> Check-in for flight **{flight_number}** to **{arrival}** has now been closed. If you have missed your flight, please attend the next one!\n\n"
-                f"-# <:Tail:1379811826467868804> **ETIHAD OPERATIONS**"
-            )
-            await chan.send(closed_message)
-
-        asyncio.create_task(send_checkin_closed())
-
-        await ctx.reply(embed=flightsuccessembed(f"Flight '{ev['name']}' started."))
-        log = self.bot.get_channel(LOGGING_CHANNEL_ID)
-        if log:
-            await log.send(embed=discord.Embed(title="Logging", color=0xE5E1DE).add_field(name="Start Flight", value=f"{ctx.author} started {ev['name']}"))
-
-
-    @commands.command()
-    async def cancelflight(self, ctx, flight_id=None):
-        if REQUIRED_ROLE_ID not in [r.id for r in ctx.author.roles]:
-            await ctx.reply("You don't have permission to use this command.")
-            return
-        if not flight_id:
-            await ctx.reply(embed=flighterrorembed("Provide a flight ID!"))
-            return
-        async with aiohttp.ClientSession() as sess:
-            r = await sess.delete(f"https://discord.com/api/v10/guilds/{GUILD_ID}/scheduled-events/{flight_id}",
-                                 headers={"Authorization": f"Bot {TOKEN}"})
-            if r.status == 204:
-                await ctx.reply(embed=flightsuccessembed(f"Flight {flight_id} canceled."))
-                log = self.bot.get_channel(LOGGING_CHANNEL_ID)
-                if log:
-                    await log.send(embed=discord.Embed(title="Logging", color=0xE5E1DE).add_field(name="Cancel Flight", value=f"{ctx.author} canceled flight {flight_id}"))
-            else:
-                await ctx.reply(embed=flighterrorembed(f"Failed (status {r.status})"))
-
-
-async def setup(bot):
-    await bot.add_cog(FlightScheduler(bot))
+                        ).add_field(name="Create Flight", value=f"{ctx.author} created flight {_
